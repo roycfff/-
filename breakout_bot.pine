@@ -387,3 +387,69 @@ if barstate.islast
     table.cell(dash, 1, 4, sessTxt,      text_color=col1)
     table.cell(dash, 0, 5, "Strategy",   text_color=col1)
     table.cell(dash, 1, 5, strategyMode, text_color=col1)
+
+//══════════════════════════════════════
+// 9. Visual Trade Markers
+//══════════════════════════════════════
+showMarkers  = input.bool(true, "Show Entry Labels",         group="Visuals")
+showSLTP     = input.bool(true, "Show SL / TP Lines",        group="Visuals")
+showSessions = input.bool(true, "Highlight Sessions",        group="Visuals")
+lineLen      = input.int(50,    "SL/TP Line Length (bars)",  group="Visuals", minval=5, maxval=500)
+
+// ── Session background highlights ─────────────────────────────────────────
+bgcolor(showSessions and inAsia   ? color.new(color.blue,   92) : na, title="Asia BG")
+bgcolor(showSessions and inLondon ? color.new(color.green,  92) : na, title="London BG")
+bgcolor(showSessions and inNY     ? color.new(color.orange, 92) : na, title="NY BG")
+
+// ── Determine if a new entry fires this bar (same guard as Section 7) ─────
+isLongEntry  = allowNewEntries and longCond  and longQty  > 0 and strategy.position_size <= 0
+isShortEntry = allowNewEntries and shortCond and shortQty > 0 and strategy.position_size >= 0
+
+// ── plotshape arrows (TradingView standard long/short markers) ─────────────
+plotshape(showMarkers and isLongEntry,
+     title="▲ Long Entry", style=shape.triangleup,
+     location=location.belowbar,
+     color=color.new(color.green, 0), size=size.normal)
+
+plotshape(showMarkers and isShortEntry,
+     title="▼ Short Entry", style=shape.triangledown,
+     location=location.abovebar,
+     color=color.new(color.red, 0), size=size.normal)
+
+// ── Detailed popup labels with entry info ─────────────────────────────────
+if showMarkers and isLongEntry
+    lbl = "▲ LONG  [" + strategyMode + "]\n" +
+          "Entry : " + str.tostring(close,          format.mintick) + "\n" +
+          "SL    : " + str.tostring(longStopPrice,  format.mintick) + "\n" +
+          "TP    : " + str.tostring(longTpPrice,    format.mintick) + "\n" +
+          "Qty   : " + str.tostring(int(longQty))
+    label.new(bar_index, low, lbl,
+         style=label.style_label_up,
+         color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+
+if showMarkers and isShortEntry
+    lbl = "▼ SHORT  [" + strategyMode + "]\n" +
+          "Entry : " + str.tostring(close,           format.mintick) + "\n" +
+          "SL    : " + str.tostring(shortStopPrice,  format.mintick) + "\n" +
+          "TP    : " + str.tostring(shortTpPrice,    format.mintick) + "\n" +
+          "Qty   : " + str.tostring(int(shortQty))
+    label.new(bar_index, high, lbl,
+         style=label.style_label_down,
+         color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+// ── SL / TP dashed horizontal lines from entry bar ────────────────────────
+if showSLTP and isLongEntry
+    line.new(bar_index, longTpPrice,   bar_index + lineLen, longTpPrice,
+         color=color.new(color.green, 0), style=line.style_dashed, width=1)
+    line.new(bar_index, longStopPrice, bar_index + lineLen, longStopPrice,
+         color=color.new(color.red,   0), style=line.style_dashed, width=1)
+    line.new(bar_index, close,         bar_index + lineLen, close,
+         color=color.new(color.gray, 50), style=line.style_dotted, width=1)
+
+if showSLTP and isShortEntry
+    line.new(bar_index, shortTpPrice,   bar_index + lineLen, shortTpPrice,
+         color=color.new(color.green, 0), style=line.style_dashed, width=1)
+    line.new(bar_index, shortStopPrice, bar_index + lineLen, shortStopPrice,
+         color=color.new(color.red,   0), style=line.style_dashed, width=1)
+    line.new(bar_index, close,          bar_index + lineLen, close,
+         color=color.new(color.gray, 50), style=line.style_dotted, width=1)
