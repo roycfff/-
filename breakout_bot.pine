@@ -1,0 +1,187 @@
+//@version=5
+strategy("PropFirm London/NY Breakout Bot SIMPLE", overlay=true, margin_long=100, margin_short=100,
+     initial_capital=10000, commission_type=strategy.commission.cash_per_contract, commission_value=3.0,
+     pyramiding=1, process_orders_on_close=true)
+
+//══════════════════════════════════════
+// 1. Prop Firm & Account Settings
+//══════════════════════════════════════
+propFirm    = input.string("FTMO", "Prop Firm", options=["FTMO", "Topstep", "Apex", "Custom"])
+accountSize = input.float(10000, "Account Size", step=1000)
+
+// אינפוטים ל-Custom
+maxDailyLossPercInput = input.float(5.0,  "Max Daily Loss %")
+maxTotalLossPercInput = input.float(10.0, "Max Total Loss %")
+profitTargetPercInput = input.float(10.0, "Profit Target %")
+
+// ערכים פעילים
+maxDailyLossPerc = 0.0
+maxTotalLossPerc = 0.0
+profitTargetPerc = 0.0
+
+if propFirm == "FTMO"
+    maxDailyLossPerc := 5.0
+    maxTotalLossPerc := 10.0
+    profitTargetPerc := 10.0
+else if propFirm == "Topstep"
+    maxDailyLossPerc := 3.0
+    maxTotalLossPerc := 6.0
+    profitTargetPerc := 10.0
+else if propFirm == "Apex"
+    maxDailyLossPerc := 3.0
+    maxTotalLossPerc := 6.0
+    profitTargetPerc := 10.0
+else
+    maxDailyLossPerc := maxDailyLossPercInput
+    maxTotalLossPerc := maxTotalLossPercInput
+    profitTargetPerc := profitTargetPercInput
+
+// המרה לדולרים
+maxDailyLoss = accountSize * maxDailyLossPerc / 100.0
+maxTotalLoss = accountSize * maxTotalLossPerc / 100.0
+profitTarget = accountSize * profitTargetPerc / 100.0
+
+//══════════════════════════════════════
+// 2. Time Windows (Sessions)
+//══════════════════════════════════════
+useSessions   = input.bool(true, "Use Sessions")
+londonSession = input.session("0700-1000", "London Session")
+nySession     = input.session("1400-1700", "New York Session")
+
+inLondon = not na(time(timeframe.period, londonSession))
+inNY     = not na(time(timeframe.period, nySession))
+activeSession = useSessions ? (inLondon or inNY) : true
+
+// סוף יום
+lastHour   = input.int(22, "Last Hour (EOD)", minval=0, maxval=23)
+lastMinute = input.int(59, "Last Minute (EOD)", minval=0, maxval=59)
+isEndOfDay = hour == lastHour and minute >= lastMinute
+
+//══════════════════════════════════════
+// 3. Risk Management & Position Size
+//══════════════════════════════════════
+riskPct     = input.float(1.0, "Risk per Trade %", step=0.1, minval=0.1, maxval=2.0)
+rr          = input.float(3.0, "Risk:Reward", step=0.5, minval=1.0, maxval=5.0)
+contractPip = input.float(0.5, "Tick / Pip Value")
+
+// מעקב Daily PnL
+var float eqStartOfDay = na
+isNewDay = ta.change(time("D")) != 0
+if na(eqStartOfDay) or isNewDay
+    eqStartOfDay := strategy.equity
+
+dailyPnL = strategy.equity - eqStartOfDay
+totalPnL = strategy.equity - accountSize
+
+// דגלי חוקים
+breachDaily   = dailyPnL <= -maxDailyLoss
+breachTotal   = totalPnL <= -maxTotalLoss
+reachTarget   = totalPnL >= profitTarget
+canTradeToday = not (breachDaily or breachTotal or reachTarget)
+
+//══════════════════════════════════════
+// 4. Breakout Logic (Asia Range)
+//══════════════════════════════════════
+asiaSession = input.session("2300-0600", "Asia Session")
+inAsia      = not na(time(timeframe.period, asiaSession))
+
+var float asiaHigh = na
+var float asiaLow  = na
+
+// BUG FIX: Reset the Asia range when the Asia session STARTS (23:00),
+// NOT at midnight (isNewDay). The session spans midnight (23:00–06:00),
+// so resetting on isNewDay caused the 23:00–00:00 data to be wiped each day.
+if not inAsia[1] and inAsia
+    asiaHigh := na
+    asiaLow  := na
+
+if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow  := na(asiaLow)  ? low  : math.min(asiaLow,  low)
+
+// תנאי פריצה אחרי אסיה בזמן London/NY
+longBreak  = activeSession and not inAsia and not na(asiaHigh) and close > asiaHigh
+shortBreak = activeSession and not inAsia and not na(asiaLow)  and close < asiaLow
+
+// סטופ בצד השני של ה-Range
+longStopPrice  = asiaLow
+shortStopPrice = asiaHigh
+
+// כניסה בשוק
+longEntryPrice  = close
+shortEntryPrice = close
+
+// סיכון לחוזה
+longRiskPerCon  = math.abs(longEntryPrice  - longStopPrice)  * contractPip
+shortRiskPerCon = math.abs(shortEntryPrice - shortStopPrice) * contractPip
+
+// גודל פוזיציה לפי אחוז סיכון
+riskCash = accountSize * riskPct / 100.0
+longQty  = longRiskPerCon  > 0 ? math.floor(riskCash / longRiskPerCon)  : 0
+shortQty = shortRiskPerCon > 0 ? math.floor(riskCash / shortRiskPerCon) : 0
+
+// TP לפי R
+longTpPrice  = longEntryPrice  + (longEntryPrice  - longStopPrice)  * rr
+shortTpPrice = shortEntryPrice - (shortStopPrice  - shortEntryPrice) * rr
+
+//══════════════════════════════════════
+// 5. מצב אסטרטגיה
+//══════════════════════════════════════
+strategyMode = input.string("Breakout Asia", "Strategy Mode",
+     options=["Breakout Asia", "Off"])
+
+longCond  = strategyMode == "Breakout Asia" and longBreak
+shortCond = strategyMode == "Breakout Asia" and shortBreak
+
+//══════════════════════════════════════
+// 6. Webhook Integration (PineConnector-style)
+//══════════════════════════════════════
+useWebhook = input.bool(true, "Enable Webhook")
+pcLicense  = input.string("PC123456", "PC License ID")
+symId      = input.string("US100.cash", "Symbol ID (MT5)")
+
+f_sendAlert(_dir, _qty, _sl, _tp) =>
+    if useWebhook
+        msg = pcLicense + "," + _dir + "," + symId + ",vol=" + str.tostring(_qty) + ",sl=" + str.tostring(_sl) + ",tp=" + str.tostring(_tp)
+        alert(msg, alert.freq_once_per_bar_close)
+
+//══════════════════════════════════════
+// 7. Entries & Exits
+//══════════════════════════════════════
+allowNewEntries = canTradeToday and activeSession and not isEndOfDay and strategyMode != "Off"
+
+if allowNewEntries
+    if longCond and longQty > 0 and strategy.position_size <= 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        strategy.exit("Long TP/SL", from_entry="Long", stop=longStopPrice, limit=longTpPrice)
+        f_sendAlert("buy", longQty, longStopPrice, longTpPrice)
+    if shortCond and shortQty > 0 and strategy.position_size >= 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        strategy.exit("Short TP/SL", from_entry="Short", stop=shortStopPrice, limit=shortTpPrice)
+        f_sendAlert("sell", shortQty, shortStopPrice, shortTpPrice)
+
+//══════════════════════════════════════
+// 8. End-of-day flat & dashboard
+//══════════════════════════════════════
+if isEndOfDay and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flat")
+
+// דשבורד
+var dash = table.new(position.top_right, 4, 5, border_width=1)
+col1     = color.new(color.white, 0)
+colRed   = color.new(color.red, 0)
+colGreen = color.new(color.lime, 0)
+f_status(_cond) => _cond ? colGreen : colRed
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Daily PnL",  text_color=col1)
+    table.cell(dash, 1, 0, str.tostring(dailyPnL, format.mintick), text_color=f_status(not breachDaily))
+    table.cell(dash, 0, 1, "Total PnL",  text_color=col1)
+    table.cell(dash, 1, 1, str.tostring(totalPnL, format.mintick), text_color=f_status(not breachTotal))
+    table.cell(dash, 0, 2, "Target",     text_color=col1)
+    table.cell(dash, 1, 2, str.tostring(profitTarget, format.mintick), text_color=f_status(reachTarget))
+    table.cell(dash, 0, 3, "Can Trade",  text_color=col1)
+    table.cell(dash, 1, 3, canTradeToday ? "YES" : "NO", text_color=f_status(canTradeToday))
+    table.cell(dash, 0, 4, "Session",    text_color=col1)
+    sessTxt = inLondon ? "London" : inNY ? "NY" : inAsia ? "Asia" : "None"
+    table.cell(dash, 1, 4, sessTxt,      text_color=col1)
