@@ -4,10 +4,18 @@
 #  DAVIDI INTELLIGENCE | Roy Davidi
 # ============================================================
 
+import os
+import ssl
+import certifi
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
+
+# ── SSL fix: point requests / urllib3 at certifi's CA bundle ──
+os.environ.setdefault("SSL_CERT_FILE",      certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+ssl._create_default_https_context = ssl.create_default_context  # noqa: SLF001
 
 from config.settings import (
     SYMBOL_MAP,
@@ -21,6 +29,30 @@ from core.risk_manager import RiskManager, Trade
 
 # ── Data Loading ─────────────────────────────────────────────
 
+def _fetch(ticker_symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV via Ticker.history() — always returns flat string columns,
+    regardless of yfinance version (avoids MultiIndex 'tuple has no .lower' bug).
+    """
+    t  = yf.Ticker(ticker_symbol)
+    df = t.history(period=period, interval=interval, auto_adjust=True)
+
+    # Safety net: if somehow still MultiIndex, pick the OHLCV level
+    if isinstance(df.columns, pd.MultiIndex):
+        ohlcv_names = {"open", "high", "low", "close", "volume"}
+        for level in range(df.columns.nlevels):
+            vals = {str(v).lower() for v in df.columns.get_level_values(level)}
+            if vals & ohlcv_names:
+                df.columns = df.columns.get_level_values(level)
+                break
+        else:
+            df.columns = df.columns.get_level_values(0)
+
+    df.columns = [str(c).strip() for c in df.columns]   # ensure plain strings
+    df.dropna(inplace=True)
+    return df
+
+
 def load_data(symbol: str, period: str = BACKTEST_PERIOD) -> dict[str, pd.DataFrame]:
     """
     Download OHLCV data for multiple timeframes.
@@ -30,19 +62,16 @@ def load_data(symbol: str, period: str = BACKTEST_PERIOD) -> dict[str, pd.DataFr
 
     print(f"Downloading {symbol} ({ticker}) data...")
 
-    daily = yf.download(ticker, period=period, interval="1d",  auto_adjust=True, progress=False)
-    h1    = yf.download(ticker, period="730d",  interval="1h",  auto_adjust=True, progress=False)
-    m15   = yf.download(ticker, period="60d",   interval="15m", auto_adjust=True, progress=False)
+    daily = _fetch(ticker, period=period,  interval="1d")
+    h1    = _fetch(ticker, period="730d",  interval="1h")
+    m15   = _fetch(ticker, period="60d",   interval="15m")
 
-    # Flatten MultiIndex columns if present
-    for df in [daily, h1, m15]:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-    # Drop empty
-    daily.dropna(inplace=True)
-    h1.dropna(inplace=True)
-    m15.dropna(inplace=True)
+    if daily.empty or h1.empty:
+        raise ValueError(
+            f"No data returned for '{ticker}'. "
+            "Check the symbol name (e.g. EURUSD → EURUSD=X in SYMBOL_MAP) "
+            "and your internet connection."
+        )
 
     print(f"  Daily:  {len(daily)} candles | {daily.index[0].date()} → {daily.index[-1].date()}")
     print(f"  H1:     {len(h1)} candles")
