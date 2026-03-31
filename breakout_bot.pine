@@ -1,0 +1,455 @@
+//@version=5
+strategy("PropFirm London/NY Breakout Bot", overlay=true, margin_long=100, margin_short=100,
+     initial_capital=10000, commission_type=strategy.commission.cash_per_contract, commission_value=3.0,
+     pyramiding=1, process_orders_on_close=true)
+
+//══════════════════════════════════════
+// 1. Prop Firm & Account Settings
+//══════════════════════════════════════
+propFirm    = input.string("FTMO", "Prop Firm", options=["FTMO", "Topstep", "Apex", "Custom"])
+accountSize = input.float(10000, "Account Size", step=1000)
+
+maxDailyLossPercInput = input.float(5.0,  "Max Daily Loss %")
+maxTotalLossPercInput = input.float(10.0, "Max Total Loss %")
+profitTargetPercInput = input.float(10.0, "Profit Target %")
+
+maxDailyLossPerc = 0.0
+maxTotalLossPerc = 0.0
+profitTargetPerc = 0.0
+
+if propFirm == "FTMO"
+    maxDailyLossPerc := 5.0
+    maxTotalLossPerc := 10.0
+    profitTargetPerc := 10.0
+else if propFirm == "Topstep"
+    maxDailyLossPerc := 3.0
+    maxTotalLossPerc := 6.0
+    profitTargetPerc := 10.0
+else if propFirm == "Apex"
+    maxDailyLossPerc := 3.0
+    maxTotalLossPerc := 6.0
+    profitTargetPerc := 10.0
+else
+    maxDailyLossPerc := maxDailyLossPercInput
+    maxTotalLossPerc := maxTotalLossPercInput
+    profitTargetPerc := profitTargetPercInput
+
+maxDailyLoss = accountSize * maxDailyLossPerc / 100.0
+maxTotalLoss = accountSize * maxTotalLossPerc / 100.0
+profitTarget = accountSize * profitTargetPerc / 100.0
+
+//══════════════════════════════════════
+// 2. Time Windows (Sessions)
+//══════════════════════════════════════
+useSessions   = input.bool(true, "Use Sessions")
+londonSession = input.session("0700-1000", "London Session")
+nySession     = input.session("1400-1700", "New York Session")
+
+inLondon = not na(time(timeframe.period, londonSession))
+inNY     = not na(time(timeframe.period, nySession))
+activeSession = useSessions ? (inLondon or inNY) : true
+
+lastHour   = input.int(22, "Last Hour (EOD)", minval=0, maxval=23)
+lastMinute = input.int(59, "Last Minute (EOD)", minval=0, maxval=59)
+isEndOfDay = hour == lastHour and minute >= lastMinute
+
+//══════════════════════════════════════
+// 3. Risk Management Settings
+//══════════════════════════════════════
+riskPct     = input.float(1.0, "Risk per Trade %", step=0.1, minval=0.1, maxval=2.0)
+rr          = input.float(3.0, "Risk:Reward", step=0.5, minval=1.0, maxval=5.0)
+contractPip = input.float(0.5, "Tick / Pip Value")
+
+var float eqStartOfDay = na
+isNewDay = ta.change(time("D")) != 0
+if na(eqStartOfDay) or isNewDay
+    eqStartOfDay := strategy.equity
+
+dailyPnL = strategy.equity - eqStartOfDay
+totalPnL = strategy.equity - accountSize
+
+breachDaily   = dailyPnL <= -maxDailyLoss
+breachTotal   = totalPnL <= -maxTotalLoss
+reachTarget   = totalPnL >= profitTarget
+canTradeToday = not (breachDaily or breachTotal or reachTarget)
+
+//══════════════════════════════════════
+// 4. Strategy Signal Blocks (all computed unconditionally)
+//══════════════════════════════════════
+
+// ── Shared indicators ───────────────────────────────────────────────────────
+atr      = ta.atr(14)
+riskCash = accountSize * riskPct / 100.0
+
+// ── S10: Pivot Points — request.security must be at top level ───────────────
+[prevH, prevL, prevC] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+pivotPP = (prevH + prevL + prevC) / 3.0
+pivotR1 = 2.0 * pivotPP - prevL
+pivotS1 = 2.0 * pivotPP - prevH
+
+// ── S1: Breakout Asia ────────────────────────────────────────────────────────
+asiaSession = input.session("2300-0600", "Asia Session", group="Strategy: Breakout Asia")
+inAsia      = not na(time(timeframe.period, asiaSession))
+
+var float asiaHigh = na
+var float asiaLow  = na
+
+// Reset at session start (23:00), NOT at midnight — session spans midnight
+if not inAsia[1] and inAsia
+    asiaHigh := na
+    asiaLow  := na
+
+if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow  := na(asiaLow)  ? low  : math.min(asiaLow, low)
+
+s1_long      = activeSession and not inAsia and not na(asiaHigh) and close > asiaHigh
+s1_short     = activeSession and not inAsia and not na(asiaLow)  and close < asiaLow
+s1_longStop  = asiaLow
+s1_shortStop = asiaHigh
+s1_longTp    = close + (close - s1_longStop)  * rr
+s1_shortTp   = close - (s1_shortStop - close) * rr
+
+// ── S2: EMA Crossover ────────────────────────────────────────────────────────
+emaFast = input.int(9,  "Fast EMA Period", group="Strategy: EMA Crossover")
+emaSlow = input.int(21, "Slow EMA Period", group="Strategy: EMA Crossover")
+
+_emaF = ta.ema(close, emaFast)
+_emaS = ta.ema(close, emaSlow)
+
+s2_long      = ta.crossover(_emaF, _emaS)
+s2_short     = ta.crossunder(_emaF, _emaS)
+s2_longStop  = close - atr
+s2_shortStop = close + atr
+s2_longTp    = close + atr * rr
+s2_shortTp   = close - atr * rr
+
+// ── S3: RSI Reversal ─────────────────────────────────────────────────────────
+rsiLen = input.int(14, "RSI Period",      group="Strategy: RSI Reversal")
+rsiOS  = input.int(30, "Oversold Level",  group="Strategy: RSI Reversal")
+rsiOB  = input.int(70, "Overbought Level",group="Strategy: RSI Reversal")
+
+_rsi = ta.rsi(close, rsiLen)
+
+s3_long      = ta.crossover(_rsi, rsiOS)
+s3_short     = ta.crossunder(_rsi, rsiOB)
+s3_longStop  = ta.lowest(low, 5)
+s3_shortStop = ta.highest(high, 5)
+s3_longTp    = close + (close - s3_longStop)  * rr
+s3_shortTp   = close - (s3_shortStop - close) * rr
+
+// ── S4: VWAP Bounce ──────────────────────────────────────────────────────────
+// ta.vwap is a built-in series (not a function), resets daily
+s4_long      = ta.crossover(close, ta.vwap)
+s4_short     = ta.crossunder(close, ta.vwap)
+s4_longStop  = low[1]
+s4_shortStop = high[1]
+s4_longTp    = close + (close - s4_longStop)  * rr
+s4_shortTp   = close - (s4_shortStop - close) * rr
+
+// ── S5: ORB London (07:00–07:30) ─────────────────────────────────────────────
+orbLonSess = input.session("0700-0730", "ORB London Window", group="Strategy: ORB London")
+inOrbLon   = not na(time(timeframe.period, orbLonSess))
+
+var float orbLonH = na
+var float orbLonL = na
+
+if not inOrbLon[1] and inOrbLon
+    orbLonH := na
+    orbLonL := na
+
+if inOrbLon
+    orbLonH := na(orbLonH) ? high : math.max(orbLonH, high)
+    orbLonL := na(orbLonL) ? low  : math.min(orbLonL, low)
+
+s5_long      = not inOrbLon and not na(orbLonH) and ta.crossover(close, orbLonH)
+s5_short     = not inOrbLon and not na(orbLonL) and ta.crossunder(close, orbLonL)
+s5_longStop  = orbLonL
+s5_shortStop = orbLonH
+s5_longTp    = close + (orbLonH - orbLonL) * rr
+s5_shortTp   = close - (orbLonH - orbLonL) * rr
+
+// ── S6: ORB New York (14:00–14:30) ───────────────────────────────────────────
+orbNYSess = input.session("1400-1430", "ORB NY Window", group="Strategy: ORB New York")
+inOrbNY   = not na(time(timeframe.period, orbNYSess))
+
+var float orbNYH = na
+var float orbNYL = na
+
+if not inOrbNY[1] and inOrbNY
+    orbNYH := na
+    orbNYL := na
+
+if inOrbNY
+    orbNYH := na(orbNYH) ? high : math.max(orbNYH, high)
+    orbNYL := na(orbNYL) ? low  : math.min(orbNYL, low)
+
+s6_long      = not inOrbNY and not na(orbNYH) and ta.crossover(close, orbNYH)
+s6_short     = not inOrbNY and not na(orbNYL) and ta.crossunder(close, orbNYL)
+s6_longStop  = orbNYL
+s6_shortStop = orbNYH
+s6_longTp    = close + (orbNYH - orbNYL) * rr
+s6_shortTp   = close - (orbNYH - orbNYL) * rr
+
+// ── S7: Bollinger Band Breakout ──────────────────────────────────────────────
+bbLen  = input.int(20,   "BB Period", group="Strategy: Bollinger Band")
+bbMult = input.float(2.0, "BB Mult",  group="Strategy: Bollinger Band")
+
+[bb_upper, bb_basis, bb_lower] = ta.bb(close, bbLen, bbMult)
+
+s7_long      = ta.crossover(close, bb_upper)
+s7_short     = ta.crossunder(close, bb_lower)
+s7_longStop  = bb_basis
+s7_shortStop = bb_basis
+s7_longTp    = close + (close - bb_basis) * rr
+s7_shortTp   = close - (bb_basis - close) * rr
+
+// ── S8: MACD Crossover ───────────────────────────────────────────────────────
+macdF = input.int(12, "MACD Fast",   group="Strategy: MACD Crossover")
+macdS = input.int(26, "MACD Slow",   group="Strategy: MACD Crossover")
+macdG = input.int(9,  "MACD Signal", group="Strategy: MACD Crossover")
+
+[_macd, _sig, _hist] = ta.macd(close, macdF, macdS, macdG)
+
+s8_long      = ta.crossover(_macd, _sig)
+s8_short     = ta.crossunder(_macd, _sig)
+s8_longStop  = close - atr * 1.5
+s8_shortStop = close + atr * 1.5
+s8_longTp    = close + atr * 1.5 * rr
+s8_shortTp   = close - atr * 1.5 * rr
+
+// ── S9: Momentum Candle ──────────────────────────────────────────────────────
+momMult = input.float(0.7, "ATR Multiplier", step=0.1, group="Strategy: Momentum Candle")
+
+s9_long      = (close - open) > atr * momMult
+s9_short     = (open - close) > atr * momMult
+s9_longStop  = low
+s9_shortStop = high
+s9_longTp    = close + (close - low)  * rr
+s9_shortTp   = close - (high - close) * rr
+
+// ── S10: Pivot Points ────────────────────────────────────────────────────────
+s10_long      = ta.crossover(close, pivotR1)
+s10_short     = ta.crossunder(close, pivotS1)
+s10_longStop  = pivotPP
+s10_shortStop = pivotPP
+s10_longTp    = pivotR1 + (pivotR1 - pivotPP) * rr
+s10_shortTp   = pivotS1 - (pivotPP - pivotS1) * rr
+
+//══════════════════════════════════════
+// 5. Strategy Selector
+//══════════════════════════════════════
+strategyMode = input.string("Breakout Asia", "Strategy Mode",
+     options=["Breakout Asia", "EMA Crossover", "RSI Reversal",
+              "VWAP Bounce",   "ORB London",    "ORB New York",
+              "Bollinger Band","MACD Crossover", "Momentum Candle",
+              "Pivot Points",  "Off"])
+
+// Defaults: stop = close → risk = 0 → qty = 0 → no entry will fire
+longCond       = false
+shortCond      = false
+longStopPrice  = close
+shortStopPrice = close
+longTpPrice    = close
+shortTpPrice   = close
+
+if strategyMode == "Breakout Asia"
+    longCond       := s1_long
+    shortCond      := s1_short
+    longStopPrice  := s1_longStop
+    shortStopPrice := s1_shortStop
+    longTpPrice    := s1_longTp
+    shortTpPrice   := s1_shortTp
+else if strategyMode == "EMA Crossover"
+    longCond       := s2_long
+    shortCond      := s2_short
+    longStopPrice  := s2_longStop
+    shortStopPrice := s2_shortStop
+    longTpPrice    := s2_longTp
+    shortTpPrice   := s2_shortTp
+else if strategyMode == "RSI Reversal"
+    longCond       := s3_long
+    shortCond      := s3_short
+    longStopPrice  := s3_longStop
+    shortStopPrice := s3_shortStop
+    longTpPrice    := s3_longTp
+    shortTpPrice   := s3_shortTp
+else if strategyMode == "VWAP Bounce"
+    longCond       := s4_long
+    shortCond      := s4_short
+    longStopPrice  := s4_longStop
+    shortStopPrice := s4_shortStop
+    longTpPrice    := s4_longTp
+    shortTpPrice   := s4_shortTp
+else if strategyMode == "ORB London"
+    longCond       := s5_long
+    shortCond      := s5_short
+    longStopPrice  := s5_longStop
+    shortStopPrice := s5_shortStop
+    longTpPrice    := s5_longTp
+    shortTpPrice   := s5_shortTp
+else if strategyMode == "ORB New York"
+    longCond       := s6_long
+    shortCond      := s6_short
+    longStopPrice  := s6_longStop
+    shortStopPrice := s6_shortStop
+    longTpPrice    := s6_longTp
+    shortTpPrice   := s6_shortTp
+else if strategyMode == "Bollinger Band"
+    longCond       := s7_long
+    shortCond      := s7_short
+    longStopPrice  := s7_longStop
+    shortStopPrice := s7_shortStop
+    longTpPrice    := s7_longTp
+    shortTpPrice   := s7_shortTp
+else if strategyMode == "MACD Crossover"
+    longCond       := s8_long
+    shortCond      := s8_short
+    longStopPrice  := s8_longStop
+    shortStopPrice := s8_shortStop
+    longTpPrice    := s8_longTp
+    shortTpPrice   := s8_shortTp
+else if strategyMode == "Momentum Candle"
+    longCond       := s9_long
+    shortCond      := s9_short
+    longStopPrice  := s9_longStop
+    shortStopPrice := s9_shortStop
+    longTpPrice    := s9_longTp
+    shortTpPrice   := s9_shortTp
+else if strategyMode == "Pivot Points"
+    longCond       := s10_long
+    shortCond      := s10_short
+    longStopPrice  := s10_longStop
+    shortStopPrice := s10_shortStop
+    longTpPrice    := s10_longTp
+    shortTpPrice   := s10_shortTp
+// "Off" → all remain false/close → qty = 0 → no trades
+
+// Position sizing — resolved after selector so it uses the active strategy's stop
+longEntryPrice  = close
+shortEntryPrice = close
+longRiskPerCon  = math.abs(longEntryPrice  - longStopPrice)  * contractPip
+shortRiskPerCon = math.abs(shortEntryPrice - shortStopPrice) * contractPip
+longQty  = longRiskPerCon  > 0 ? math.floor(riskCash / longRiskPerCon)  : 0
+shortQty = shortRiskPerCon > 0 ? math.floor(riskCash / shortRiskPerCon) : 0
+
+//══════════════════════════════════════
+// 6. Webhook Integration (PineConnector-style)
+//══════════════════════════════════════
+useWebhook = input.bool(true, "Enable Webhook")
+pcLicense  = input.string("PC123456", "PC License ID")
+symId      = input.string("US100.cash", "Symbol ID (MT5)")
+
+f_sendAlert(_dir, _qty, _sl, _tp) =>
+    if useWebhook
+        msg = pcLicense + "," + _dir + "," + symId + ",vol=" + str.tostring(_qty) + ",sl=" + str.tostring(_sl) + ",tp=" + str.tostring(_tp)
+        alert(msg, alert.freq_once_per_bar_close)
+
+//══════════════════════════════════════
+// 7. Entries & Exits
+//══════════════════════════════════════
+allowNewEntries = canTradeToday and activeSession and not isEndOfDay and strategyMode != "Off"
+
+if allowNewEntries
+    if longCond and longQty > 0 and strategy.position_size <= 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        strategy.exit("Long TP/SL", from_entry="Long", stop=longStopPrice, limit=longTpPrice)
+        f_sendAlert("buy", longQty, longStopPrice, longTpPrice)
+    if shortCond and shortQty > 0 and strategy.position_size >= 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        strategy.exit("Short TP/SL", from_entry="Short", stop=shortStopPrice, limit=shortTpPrice)
+        f_sendAlert("sell", shortQty, shortStopPrice, shortTpPrice)
+
+//══════════════════════════════════════
+// 8. End-of-day flat & dashboard
+//══════════════════════════════════════
+if isEndOfDay and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flat")
+
+var dash = table.new(position.top_right, 2, 6, border_width=1)
+col1     = color.new(color.white, 0)
+colRed   = color.new(color.red, 0)
+colGreen = color.new(color.lime, 0)
+f_status(_cond) => _cond ? colGreen : colRed
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Daily PnL",  text_color=col1)
+    table.cell(dash, 1, 0, str.tostring(dailyPnL, format.mintick), text_color=f_status(not breachDaily))
+    table.cell(dash, 0, 1, "Total PnL",  text_color=col1)
+    table.cell(dash, 1, 1, str.tostring(totalPnL, format.mintick), text_color=f_status(not breachTotal))
+    table.cell(dash, 0, 2, "Target",     text_color=col1)
+    table.cell(dash, 1, 2, str.tostring(profitTarget, format.mintick), text_color=f_status(reachTarget))
+    table.cell(dash, 0, 3, "Can Trade",  text_color=col1)
+    table.cell(dash, 1, 3, canTradeToday ? "YES" : "NO", text_color=f_status(canTradeToday))
+    table.cell(dash, 0, 4, "Session",    text_color=col1)
+    sessTxt = inLondon ? "London" : inNY ? "NY" : inAsia ? "Asia" : "None"
+    table.cell(dash, 1, 4, sessTxt,      text_color=col1)
+    table.cell(dash, 0, 5, "Strategy",   text_color=col1)
+    table.cell(dash, 1, 5, strategyMode, text_color=col1)
+
+//══════════════════════════════════════
+// 9. Visual Trade Markers
+//══════════════════════════════════════
+showMarkers  = input.bool(true, "Show Entry Labels",         group="Visuals")
+showSLTP     = input.bool(true, "Show SL / TP Lines",        group="Visuals")
+showSessions = input.bool(true, "Highlight Sessions",        group="Visuals")
+lineLen      = input.int(50,    "SL/TP Line Length (bars)",  group="Visuals", minval=5, maxval=500)
+
+// ── Session background highlights ─────────────────────────────────────────
+bgcolor(showSessions and inAsia   ? color.new(color.blue,   92) : na, title="Asia BG")
+bgcolor(showSessions and inLondon ? color.new(color.green,  92) : na, title="London BG")
+bgcolor(showSessions and inNY     ? color.new(color.orange, 92) : na, title="NY BG")
+
+// ── Determine if a new entry fires this bar (same guard as Section 7) ─────
+isLongEntry  = allowNewEntries and longCond  and longQty  > 0 and strategy.position_size <= 0
+isShortEntry = allowNewEntries and shortCond and shortQty > 0 and strategy.position_size >= 0
+
+// ── plotshape arrows (TradingView standard long/short markers) ─────────────
+plotshape(showMarkers and isLongEntry,
+     title="▲ Long Entry", style=shape.triangleup,
+     location=location.belowbar,
+     color=color.new(color.green, 0), size=size.normal)
+
+plotshape(showMarkers and isShortEntry,
+     title="▼ Short Entry", style=shape.triangledown,
+     location=location.abovebar,
+     color=color.new(color.red, 0), size=size.normal)
+
+// ── Detailed popup labels with entry info ─────────────────────────────────
+if showMarkers and isLongEntry
+    lbl = "▲ LONG  [" + strategyMode + "]\n" +
+          "Entry : " + str.tostring(close,          format.mintick) + "\n" +
+          "SL    : " + str.tostring(longStopPrice,  format.mintick) + "\n" +
+          "TP    : " + str.tostring(longTpPrice,    format.mintick) + "\n" +
+          "Qty   : " + str.tostring(int(longQty))
+    label.new(bar_index, low, lbl,
+         style=label.style_label_up,
+         color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+
+if showMarkers and isShortEntry
+    lbl = "▼ SHORT  [" + strategyMode + "]\n" +
+          "Entry : " + str.tostring(close,           format.mintick) + "\n" +
+          "SL    : " + str.tostring(shortStopPrice,  format.mintick) + "\n" +
+          "TP    : " + str.tostring(shortTpPrice,    format.mintick) + "\n" +
+          "Qty   : " + str.tostring(int(shortQty))
+    label.new(bar_index, high, lbl,
+         style=label.style_label_down,
+         color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+// ── SL / TP dashed horizontal lines from entry bar ────────────────────────
+if showSLTP and isLongEntry
+    line.new(bar_index, longTpPrice,   bar_index + lineLen, longTpPrice,
+         color=color.new(color.green, 0), style=line.style_dashed, width=1)
+    line.new(bar_index, longStopPrice, bar_index + lineLen, longStopPrice,
+         color=color.new(color.red,   0), style=line.style_dashed, width=1)
+    line.new(bar_index, close,         bar_index + lineLen, close,
+         color=color.new(color.gray, 50), style=line.style_dotted, width=1)
+
+if showSLTP and isShortEntry
+    line.new(bar_index, shortTpPrice,   bar_index + lineLen, shortTpPrice,
+         color=color.new(color.green, 0), style=line.style_dashed, width=1)
+    line.new(bar_index, shortStopPrice, bar_index + lineLen, shortStopPrice,
+         color=color.new(color.red,   0), style=line.style_dashed, width=1)
+    line.new(bar_index, close,          bar_index + lineLen, close,
+         color=color.new(color.gray, 50), style=line.style_dotted, width=1)
